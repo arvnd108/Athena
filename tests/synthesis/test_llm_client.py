@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import sys
 
+import httpx
 import pytest
 
 from secondlook.synthesis.llm_client import (
     LLM_PROVIDERS,
     AnthropicClient,
+    LLMClientError,
     OpenAICompatibleClient,
     get_llm_client,
     llm_enabled,
@@ -105,3 +107,73 @@ class TestOpenAICompatibleConstruction:
         monkeypatch.delenv("ATHENA_LLM_BASE_URL", raising=False)
         with pytest.raises(Exception, match="ATHENA_LLM_"):
             OpenAICompatibleClient()
+
+
+class TestOpenAICompatibleRetry:
+    """Covers issue #124: a transient 503 from the backend (observed live against
+    Gemini Flash -- "This model is currently experiencing high demand") must not
+    fail the whole chat turn."""
+
+    def _client(self, transport: httpx.BaseTransport) -> OpenAICompatibleClient:
+        return OpenAICompatibleClient(
+            base_url="http://llm.test/v1",
+            model="test-model",
+            client=httpx.Client(transport=transport),
+        )
+
+    def test_retries_then_succeeds_on_transient_503(self, monkeypatch):
+        monkeypatch.setattr("secondlook.http_retry.time.sleep", lambda _s: None)
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) < 2:
+                return httpx.Response(503, json={"error": "high demand"})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "final answer"}}]})
+
+        client = self._client(httpx.MockTransport(handler))
+        assert client.complete("prompt") == "final answer"
+        assert len(calls) == 2
+
+    def test_retry_exhausted_raises_llm_client_error(self, monkeypatch):
+        """After the retry budget is spent, callers still get LLMClientError -- not
+        a raw httpx exception -- matching how UniProtLookupError etc. already wrap
+        an exhausted retry."""
+        monkeypatch.setattr("secondlook.http_retry.time.sleep", lambda _s: None)
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(503, json={"error": "high demand"})
+
+        client = self._client(httpx.MockTransport(handler))
+        with pytest.raises(LLMClientError, match="OpenAI-compatible request failed"):
+            client.complete("prompt")
+        assert len(calls) == 3
+
+    def test_transport_error_is_retried_then_wrapped(self, monkeypatch):
+        """Connection resets (not just status codes) hit the same retry path, and
+        the httpx call -- not just the status check -- must be inside the retry."""
+        monkeypatch.setattr("secondlook.http_retry.time.sleep", lambda _s: None)
+
+        class ResettingTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("reset by peer", request=request)
+
+        client = self._client(ResettingTransport())
+        with pytest.raises(LLMClientError, match="OpenAI-compatible request failed"):
+            client.complete("prompt")
+
+    def test_non_retryable_status_is_not_retried(self, monkeypatch):
+        """A 400 is a real client error, not a transient blip -- one attempt only."""
+        monkeypatch.setattr("secondlook.http_retry.time.sleep", lambda _s: None)
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(400, json={"error": "bad request"})
+
+        client = self._client(httpx.MockTransport(handler))
+        with pytest.raises(LLMClientError):
+            client.complete("prompt")
+        assert len(calls) == 1
